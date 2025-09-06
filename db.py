@@ -1,19 +1,20 @@
 # db.py
-import os, sqlite3
+import os, sqlite3, logging
+
+log = logging.getLogger("db")
 
 def _select_db_path() -> str:
-    # Respect explicit env first
     env_path = os.environ.get("DB_PATH")
     if env_path:
         return env_path
-    # Prefer persistent mount if present, else fall back to tmp
+    # Prefer persistent /data if available, else /tmp
     for base in ("/data", "/persistent", "/workspace", "/home/user/app/data", "/tmp"):
         try:
             if os.path.isdir(base) and os.access(base, os.W_OK):
                 return os.path.join(base, "events.sqlite")
         except Exception:
             continue
-    # Last resort: current dir (may fail if read-only)
+    # Last resort: current dir (may be read-only on Spaces)
     return os.path.abspath("events.sqlite")
 
 DB_PATH = _select_db_path()
@@ -25,6 +26,7 @@ def _ensure_dir(path: str):
 
 def get_conn():
     _ensure_dir(DB_PATH)
+    log.info("Opening SQLite at DB_PATH=%s", DB_PATH)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
