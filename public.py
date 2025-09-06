@@ -212,24 +212,38 @@ async def delete_public_by_id(public_id: str = Path(..., description="MongoDB id
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.delete("/public")
-async def delete_public(
-    page: Optional[str] = Query(default=None, description="Filter by path substring"),
-    q: Optional[str] = Query(default=None, description="Substring search in payload/user_agent/ref"),
+async def delete_public_events(
+    page: Optional[str] = Query(default=None, description="Filter by page"),
+    ip: Optional[str] = Query(default=None, description="Filter by IP"),
+    from_ts: Optional[int] = Query(default=None, description="Unix epoch secs from (inclusive)"),
+    to_ts: Optional[int] = Query(default=None, description="Unix epoch secs to (inclusive)"),
     confirm: bool = Query(default=False, description="Must be true to execute delete"),
 ):
     if not confirm:
         raise HTTPException(status_code=400, detail="Set confirm=true to execute delete")
     try:
-        filt: Dict[str, Any] = {}
+        conditions = []
         if page:
-            filt["page"] = {"$regex": page, "$options": "i"}
-        if q:
-            filt["$or"] = [
-                {"payload": {"$regex": q, "$options": "i"}},
-                {"user_agent": {"$regex": q, "$options": "i"}},
-                {"ref": {"$regex": q, "$options": "i"}},
-            ]
-        deleted = await PublicEvent.find(filt).delete()
-        return {"ok": True, "deleted": deleted}
+            conditions.append(PublicEvent.page == page)
+        if ip:
+            conditions.append(PublicEvent.ip == ip)
+        if from_ts is not None or to_ts is not None:
+            rng = {}
+            if from_ts is not None:
+                rng["$gte"] = from_ts
+            if to_ts is not None:
+                rng["$lte"] = to_ts
+            conditions.append({"created_at": rng})
+            
+        # Fix: Extract deleted_count from DeleteResult
+        if conditions:
+            result = await PublicEvent.find({"$and": conditions}).delete()
+        else:
+            result = await PublicEvent.delete_all()
+            
+        # Return the count, not the DeleteResult object
+        deleted_count = result.deleted_count if hasattr(result, 'deleted_count') else 0
+        return {"ok": True, "deleted": deleted_count}
+        
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

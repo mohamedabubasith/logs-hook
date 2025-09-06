@@ -18,7 +18,8 @@ class BaseEvent(BaseModel):
 def client_ip(req: Request) -> Optional[str]:
     xff = req.headers.get("x-forwarded-for")
     if xff:
-        return xff.split(",").strip()
+        # Fix: split returns a list, so get first element then strip
+        return xff.split(",")[0].strip()
     return req.client.host if req.client else None
 
 @router.post("/hook")
@@ -51,7 +52,6 @@ async def list_events(
     limit: int = Query(default=50, ge=1, le=MAX_LIMIT),
 ):
     try:
-        # Build Beanie/Mongo filters
         conditions = []
         if event_type:
             conditions.append(WebhookEvent.event_type == event_type)
@@ -63,16 +63,23 @@ async def list_events(
                 rng["$gte"] = from_ts
             if to_ts is not None:
                 rng["$lte"] = to_ts
-            conditions.append({"created_at": rng})
+            conditions.append(WebhookEvent.created_at.in_(rng))
         if q:
-            conditions.append({"$or": [
-                {"payload": {"$regex": q, "$options": "i"}},
-                {"user_agent": {"$regex": q, "$options": "i"}},
-            ]})
+            # Fix: Use proper Beanie syntax for regex queries
+            conditions.append({
+                "$or": [
+                    {"payload": {"$regex": q, "$options": "i"}},
+                    {"user_agent": {"$regex": q, "$options": "i"}},
+                ]
+            })
 
-        query = WebhookEvent.find({"$and": conditions} if conditions else {})
+        if conditions:
+            query = WebhookEvent.find({"$and": conditions})
+        else:
+            query = WebhookEvent.find()
+            
         total = await query.count()
-        docs = await query.sort("-id").skip(offset).limit(limit).to_list()
+        docs = await query.sort(-WebhookEvent.created_at).skip(offset).limit(limit).to_list()
 
         items = [{
             "id": str(d.id),
@@ -116,7 +123,10 @@ async def export_events(
                 {"user_agent": {"$regex": q, "$options": "i"}},
             ]})
 
-        docs = await WebhookEvent.find({"$and": conditions} if conditions else {}).sort("-id").to_list()
+        if conditions:
+            docs = await WebhookEvent.find({"$and": conditions}).sort(-WebhookEvent.created_at).to_list()
+        else:
+            docs = await WebhookEvent.find().sort(-WebhookEvent.created_at).to_list()
 
         items = [{
             "id": str(d.id),
@@ -131,11 +141,11 @@ async def export_events(
         if fmt == "json":
             return JSONResponse(content=items)
 
-        def to_csv(rows: List[Dict[str, Any]]):
+        def generate_csv():
             buffer = io.StringIO()
             writer = csv.writer(buffer)
             writer.writerow(["id", "type", "user_id", "ip", "user_agent", "payload", "created_at"])
-            for r in rows:
+            for r in items:
                 writer.writerow([
                     r.get("id"),
                     r.get("type"),
@@ -148,7 +158,7 @@ async def export_events(
             yield buffer.getvalue()
 
         return StreamingResponse(
-            to_csv(items),
+            generate_csv(),
             media_type="text/csv",
             headers={"Content-Disposition": "attachment; filename=events_export.csv"},
         )
@@ -161,7 +171,7 @@ async def delete_event_by_id(event_id: str = Path(..., description="MongoDB id a
         d = await WebhookEvent.get(event_id)
         if not d:
             raise HTTPException(status_code=404, detail="Event not found")
-        res = await d.delete()
+        await d.delete()
         return {"ok": True, "deleted": 1}
     except HTTPException:
         raise
@@ -197,8 +207,16 @@ async def delete_events(
                 {"payload": {"$regex": q, "$options": "i"}},
                 {"user_agent": {"$regex": q, "$options": "i"}},
             ]})
-        filt = {"$and": conditions} if conditions else {}
-        res = await WebhookEvent.find(filt).delete()
-        return {"ok": True, "deleted": res}
+            
+        # Fix: Extract deleted_count from DeleteResult
+        if conditions:
+            result = await WebhookEvent.find({"$and": conditions}).delete()
+        else:
+            result = await WebhookEvent.delete_all()
+            
+        # Return the count, not the DeleteResult object
+        deleted_count = result.deleted_count if hasattr(result, 'deleted_count') else 0
+        return {"ok": True, "deleted": deleted_count}
+        
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
