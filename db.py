@@ -1,9 +1,15 @@
 # db.py
-import sqlite3
+import os, sqlite3
 
-DB_PATH = "events.sqlite"
+DB_PATH = os.environ.get("DB_PATH", "/data/events.sqlite")
+
+def _ensure_dir(path: str):
+    d = os.path.dirname(path)
+    if d and not os.path.exists(d):
+        os.makedirs(d, exist_ok=True)
 
 def get_conn():
+    _ensure_dir(DB_PATH)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
