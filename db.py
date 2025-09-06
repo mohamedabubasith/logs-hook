@@ -1,72 +1,79 @@
 # db.py
-import os, sqlite3, logging
+import os
+import logging
+import certifi
+from typing import Optional, Dict, Any
+
+from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo import ASCENDING, IndexModel
+from pymongo.server_api import ServerApi
+from beanie import Document, init_beanie
 
 log = logging.getLogger("db")
 
-def _select_db_path() -> str:
-    env_path = os.environ.get("DB_PATH")
-    print("_select_db_path called --------> ")
-    if env_path:
-        return env_path
-    # Prefer persistent /data if available, else /tmp
-    for base in ("/data", "/persistent", "/workspace", "/home/user/app/data", "/tmp"):
-        try:
-            if os.path.isdir(base) and os.access(base, os.W_OK):
-                return os.path.join(base, "events.sqlite")
-        except Exception:
-            continue
-    # Last resort: current dir (may be read-only on Spaces)
-    return os.path.abspath("events.sqlite")
+# Use your MongoDB URI directly here (set via env for safety in prod)
+MONGODB_URI = os.environ.get(
+    "MONGODB_URI",
+    "mongodb+srv://abu:abu@abucluster.y8rtyqg.mongodb.net/?retryWrites=true&w=majority&appName=AbuCluster",
+)
+MONGO_DB_NAME = os.environ.get("MONGO_DB_NAME", "logsdb")
 
-DB_PATH = _select_db_path()
+# ---------- Models ----------
+class WebhookEvent(Document):
+    event_type: str
+    user_id: Optional[str] = None
+    ip: Optional[str] = None
+    user_agent: Optional[str] = None
+    payload: Dict[str, Any]
+    created_at: int
 
-def _ensure_dir(path: str):
-    d = os.path.dirname(path)
-    print("_ensure_dir called --------> ", path)
-    if d and not os.path.exists(d):
-        os.makedirs(d, exist_ok=True)
+    class Settings:
+        name = "webhook_events"
+        indexes = [
+            "event_type",
+            "user_id",
+            "created_at",
+        ]
 
-def get_conn():
-    print("get_conn called --------> ")
-    _ensure_dir(DB_PATH)
-    log.info("Opening SQLite at DB_PATH=%s", DB_PATH)
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+class PublicEvent(Document):
+    page: str
+    ref: Optional[str] = None
+    ip: Optional[str] = None
+    user_agent: Optional[str] = None
+    payload: Dict[str, Any]
+    created_at: int
 
-def init_db():
-    print("init_db called --------> ")
-    conn = get_conn()
-    cur = conn.cursor()
+    class Settings:
+        name = "public_events"
+        # Compound unique index on (page, ip)
+        indexes = [
+            IndexModel([("page", ASCENDING), ("ip", ASCENDING)], name="ux_public_events_page_ip", unique=True)
+        ]
 
-    # Internal/app events
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS webhook_events (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        event_type TEXT NOT NULL,
-        user_id TEXT,
-        ip TEXT,
-        user_agent TEXT,
-        payload TEXT NOT NULL,
-        created_at INTEGER NOT NULL
+# ---------- Init / Close ----------
+_client: Optional[AsyncIOMotorClient] = None
+
+async def init_db():
+    global _client
+    if _client is not None:
+        return
+    log.info("Connecting to MongoDB (TLS enabled) for Beanie...")
+    _client = AsyncIOMotorClient(
+        MONGODB_URI,
+        tls=True,
+        tlsCAFile=certifi.where(),
+        server_api=ServerApi("1"),
+        serverSelectionTimeoutMS=30000,
+        connectTimeoutMS=30000,
+        socketTimeoutMS=30000,
     )
-    """)
+    # Verify connectivity
+    await _client.admin.command("ping")
+    await init_beanie(database=_client[MONGO_DB_NAME], document_models=[WebhookEvent, PublicEvent])
+    log.info("MongoDB connected; Beanie initialized with models.")
 
-    # Public/visitor events (no country column)
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS public_events (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        page TEXT,
-        ref TEXT,
-        ip TEXT,
-        user_agent TEXT,
-        payload TEXT NOT NULL,
-        created_at INTEGER NOT NULL
-    )
-    """)
-
-    # Unique index for UPSERT by (page, ip)
-    cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_public_events_page_ip ON public_events(page, ip)")
-    conn.commit()
-
-    conn.close()
+async def close_db():
+    global _client
+    if _client:
+        _client.close()
+        _client = None

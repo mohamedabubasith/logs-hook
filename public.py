@@ -1,11 +1,11 @@
 # public.py
-from fastapi import APIRouter, Request, HTTPException, Query
+from fastapi import APIRouter, Request, HTTPException, Query, Path
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import json, time, io, csv, ipaddress
 
-from db import get_conn
+from db import PublicEvent
 
 router = APIRouter(prefix="", tags=["public"])
 MAX_LIMIT = 200
@@ -58,19 +58,9 @@ def client_ua(req: Request) -> str:
 
 @router.post("/public")
 async def public_track(req: Request, body: PublicIn):
-    """
-    Accepts:
-    {
-      "path": "/shen",
-      "visitor_info": { ... full geo/meta json ... },
-      "ref": "https://ref.example"
-    }
-    Returns: { id, path, visitor_info }
-    """
     try:
         ip = client_ip(req)
         ua = client_ua(req)
-
         payload = {
             "path": body.path,
             "ref": body.ref,
@@ -80,199 +70,166 @@ async def public_track(req: Request, body: PublicIn):
             }
         }
 
-        conn = get_conn()
-        cur = conn.cursor()
-        # Upsert by (page, ip): repeat same page+ip updates latest info; new ip creates new row
-        cur.execute(
-            """
-            INSERT INTO public_events (page, ref, ip, user_agent, payload, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(page, ip) DO UPDATE SET
-                ref = excluded.ref,
-                user_agent = excluded.user_agent,
-                payload = excluded.payload,
-                created_at = excluded.created_at
-            """,
-            (body.path, body.ref, ip, ua, json.dumps(payload), int(time.time()))
-        )
-        conn.commit()
+        # Upsert by (page, ip)
+        existing = await PublicEvent.find_one(PublicEvent.page == body.path, PublicEvent.ip == ip)
+        created_at = int(time.time())
+        if existing:
+            existing.ref = body.ref
+            existing.user_agent = ua
+            existing.payload = payload
+            existing.created_at = created_at
+            await existing.save()
+            doc_id = str(existing.id)
+        else:
+            doc = PublicEvent(page=body.path, ref=body.ref, ip=ip, user_agent=ua, payload=payload, created_at=created_at)
+            saved = await doc.insert()
+            doc_id = str(saved.id)
 
-        cur.execute(
-            "SELECT id FROM public_events WHERE page = ? AND ip = ? ORDER BY id DESC LIMIT 1",
-            (body.path, ip)
-        )
-        row = cur.fetchone()
-        conn.close()
-
-        return JSONResponse(content={
-            "id": row["id"] if row else None,
-            "path": body.path,
-            "visitor_info": body.visitor_info or {}
-        })
+        return JSONResponse(content={"id": doc_id, "path": body.path, "visitor_info": body.visitor_info or {}})
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/public")
-def list_public(
+async def list_public(
     page: Optional[str] = Query(default=None, description="Filter by path substring"),
     q: Optional[str] = Query(default=None, description="Substring search in payload/user_agent/ref"),
     include_payload: bool = Query(default=False, description="Include visitor_info in response"),
     offset: int = Query(default=0, ge=0),
     limit: Optional[str] = Query(default="50", description='Number of rows, or "all" to return everything'),
 ):
-    conn = get_conn()
-    cur = conn.cursor()
+    try:
+        filt: Dict[str, Any] = {}
+        if page:
+            filt["page"] = {"$regex": page, "$options": "i"}
+        if q:
+            filt["$or"] = [
+                {"payload": {"$regex": q, "$options": "i"}},
+                {"user_agent": {"$regex": q, "$options": "i"}},
+                {"ref": {"$regex": q, "$options": "i"}},
+            ]
+        query = PublicEvent.find(filt)
+        total = await query.count()
 
-    where, params = [], []
-    if page:
-        where.append("page LIKE ?"); params.append(f"%{page}%")
-    if q:
-        where.append("(payload LIKE ? OR user_agent LIKE ? OR ref LIKE ?)")
-        like = f"%{q}%"; params.extend([like, like, like])
+        if isinstance(limit, str) and limit.lower() == "all":
+            docs = await query.sort("-id").to_list()
+            current_limit = total
+            current_offset = 0
+        else:
+            try:
+                lim_int = max(1, min(MAX_LIMIT, int(limit)))
+            except Exception:
+                lim_int = 50
+            docs = await query.sort("-id").skip(offset).limit(lim_int).to_list()
+            current_limit = lim_int
+            current_offset = offset
 
-    where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+        if include_payload:
+            items = [{
+                "id": str(d.id),
+                "path": d.page,
+                "visitor_info": ((d.payload or {}).get("data", {}) or {}).get("meta", {}) if isinstance(d.payload, dict) else {},
+                "created_at": d.created_at,
+            } for d in docs]
+        else:
+            items = [{
+                "id": str(d.id),
+                "path": d.page,
+                "created_at": d.created_at,
+            } for d in docs]
 
-    # Total count
-    cur.execute(f"SELECT COUNT(*) AS c FROM public_events {where_sql}", params)
-    total = cur.fetchone()["c"]
-
-    # Page or all
-    sql = f"""
-        SELECT id, page, ref, ip, user_agent, payload, created_at
-        FROM public_events
-        {where_sql}
-        ORDER BY id DESC
-    """
-    rows = []
-    if isinstance(limit, str) and limit.lower() == "all":
-        cur.execute(sql, params)
-        rows = cur.fetchall()
-        current_limit = total
-        current_offset = 0
-    else:
-        # parse numeric limit
-        try:
-            lim_int = max(1, min(200, int(limit)))
-        except Exception:
-            lim_int = 50
-        cur.execute(sql + " LIMIT ? OFFSET ?", params + [lim_int, offset])
-        rows = cur.fetchall()
-        current_limit = lim_int
-        current_offset = offset
-
-    conn.close()
-
-    if include_payload:
-        items = [{
-            "id": r["id"],
-            "path": r["page"],
-            "visitor_info": (json.loads(r["payload"]).get("data", {}).get("meta", {}) if r["payload"] else {}),
-            "created_at": r["created_at"],
-        } for r in rows]
-    else:
-        items = [{
-            "id": r["id"],
-            "path": r["page"],
-            "created_at": r["created_at"],
-        } for r in rows]
-
-    return {"total": total, "count": len(items), "offset": current_offset, "limit": current_limit, "items": items}
+        return {"total": total, "count": len(items), "offset": current_offset, "limit": current_limit, "items": items}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/public/export")
-def export_public(
+async def export_public(
     page: Optional[str] = Query(default=None, description="Filter by path substring"),
     q: Optional[str] = Query(default=None, description="Substring search in payload/user_agent/ref"),
     fmt: str = Query(default="json", pattern="^(json|csv)$", description="Export format: json or csv"),
     include_payload: bool = Query(default=False, description="Include visitor_info in JSON export"),
 ):
-    conn = get_conn()
-    cur = conn.cursor()
+    try:
+        filt: Dict[str, Any] = {}
+        if page:
+            filt["page"] = {"$regex": page, "$options": "i"}
+        if q:
+            filt["$or"] = [
+                {"payload": {"$regex": q, "$options": "i"}},
+                {"user_agent": {"$regex": q, "$options": "i"}},
+                {"ref": {"$regex": q, "$options": "i"}},
+            ]
+        docs = await PublicEvent.find(filt).sort("-id").to_list()
 
-    where, params = [], []
-    if page:
-        where.append("page LIKE ?"); params.append(f"%{page}%")
-    if q:
-        where.append("(payload LIKE ? OR user_agent LIKE ? OR ref LIKE ?)")
-        like = f"%{q}%"; params.extend([like, like, like])
+        if fmt == "json":
+            if include_payload:
+                items = [{
+                    "id": str(d.id),
+                    "path": d.page,
+                    "visitor_info": ((d.payload or {}).get("data", {}) or {}).get("meta", {}) if isinstance(d.payload, dict) else {},
+                    "created_at": d.created_at,
+                } for d in docs]
+            else:
+                items = [{
+                    "id": str(d.id),
+                    "path": d.page,
+                    "created_at": d.created_at,
+                } for d in docs]
+            return JSONResponse(content=items)
 
-    where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+        def to_csv(rows: List[Dict[str, Any]]):
+            buffer = io.StringIO()
+            writer = csv.writer(buffer)
+            if include_payload:
+                writer.writerow(["id", "path", "created_at", "visitor_info"])
+                for d in docs:
+                    vi = ((d.payload or {}).get("data", {}) or {}).get("meta", {}) if isinstance(d.payload, dict) else {}
+                    writer.writerow([str(d.id), d.page, d.created_at, json.dumps(vi, ensure_ascii=False)])
+            else:
+                writer.writerow(["id", "path", "created_at"])
+                for d in docs:
+                    writer.writerow([str(d.id), d.page, d.created_at])
+            yield buffer.getvalue()
 
-    cur.execute(f"""
-        SELECT id, page, ref, ip, user_agent, payload, created_at
-        FROM public_events
-        {where_sql}
-        ORDER BY id DESC
-    """, params)
-    rows = cur.fetchall()
-    conn.close()
-
-    if fmt == "json":
-        if include_payload:
-            items = [{
-                "id": r["id"],
-                "path": r["page"],
-                "visitor_info": (json.loads(r["payload"]).get("data", {}).get("meta", {}) if r["payload"] else {}),
-                "created_at": r["created_at"],
-            } for r in rows]
-        else:
-            items = [{
-                "id": r["id"],
-                "path": r["page"],
-                "created_at": r["created_at"],
-            } for r in rows]
-        return JSONResponse(content=items)
-
-    # CSV export: flat concise columns
-    def to_csv():
-        buffer = io.StringIO()
-        writer = csv.writer(buffer)
-        writer.writerow(["id", "path", "ip", "created_at"])
-        for r in rows:
-            writer.writerow([r["id"], r["page"], r["ip"], r["created_at"]])
-        yield buffer.getvalue()
-
-    return StreamingResponse(
-        to_csv(),
-        media_type="text/csv",
-        headers={"Content-Disposition": "attachment; filename=public_events_export.csv"},
-    )
-
-
-from fastapi import Path
+        return StreamingResponse(
+            to_csv([]),
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=public_events_export.csv"},
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.delete("/public/{public_id}")
-def delete_public_by_id(public_id: int = Path(..., ge=1)):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM public_events WHERE id = ?", (public_id,))
-    deleted = cur.rowcount
-    conn.commit()
-    conn.close()
-    if deleted == 0:
-        raise HTTPException(status_code=404, detail="Public event not found")
-    return {"ok": True, "deleted": deleted}
+async def delete_public_by_id(public_id: str = Path(..., description="MongoDB id as string")):
+    try:
+        d = await PublicEvent.get(public_id)
+        if not d:
+            raise HTTPException(status_code=404, detail="Public event not found")
+        await d.delete()
+        return {"ok": True, "deleted": 1}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.delete("/public")
-def delete_public(
+async def delete_public(
     page: Optional[str] = Query(default=None, description="Filter by path substring"),
     q: Optional[str] = Query(default=None, description="Substring search in payload/user_agent/ref"),
     confirm: bool = Query(default=False, description="Must be true to execute delete"),
 ):
     if not confirm:
         raise HTTPException(status_code=400, detail="Set confirm=true to execute delete")
-    conn = get_conn()
-    cur = conn.cursor()
-
-    where, params = [], []
-    if page:
-        where.append("page LIKE ?"); params.append(f"%{page}%")
-    if q:
-        where.append("(payload LIKE ? OR user_agent LIKE ? OR ref LIKE ?)")
-        like = f"%{q}%"; params.extend([like, like, like])
-
-    where_sql = f"WHERE {' AND '.join(where)}" if where else ""
-    cur.execute(f"DELETE FROM public_events {where_sql}", params)
-    deleted = cur.rowcount
-    conn.commit()
-    conn.close()
-    return {"ok": True, "deleted": deleted}
+    try:
+        filt: Dict[str, Any] = {}
+        if page:
+            filt["page"] = {"$regex": page, "$options": "i"}
+        if q:
+            filt["$or"] = [
+                {"payload": {"$regex": q, "$options": "i"}},
+                {"user_agent": {"$regex": q, "$options": "i"}},
+                {"ref": {"$regex": q, "$options": "i"}},
+            ]
+        deleted = await PublicEvent.find(filt).delete()
+        return {"ok": True, "deleted": deleted}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

@@ -4,3 +4,7 @@ pydantic
 sqlalchemy
 databases[sqlite]
 python-dotenv
+motor
+pymongo
+certifi
+beanie
