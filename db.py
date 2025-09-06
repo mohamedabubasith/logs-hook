@@ -5,6 +5,7 @@ log = logging.getLogger("db")
 
 def _select_db_path() -> str:
     env_path = os.environ.get("DB_PATH")
+    print("_select_db_path called --------> ")
     if env_path:
         return env_path
     # Prefer persistent /data if available, else /tmp
@@ -21,10 +22,12 @@ DB_PATH = _select_db_path()
 
 def _ensure_dir(path: str):
     d = os.path.dirname(path)
+    print("_ensure_dir called --------> ", path)
     if d and not os.path.exists(d):
         os.makedirs(d, exist_ok=True)
 
 def get_conn():
+    print("get_conn called --------> ")
     _ensure_dir(DB_PATH)
     log.info("Opening SQLite at DB_PATH=%s", DB_PATH)
     conn = sqlite3.connect(DB_PATH)
@@ -32,6 +35,7 @@ def get_conn():
     return conn
 
 def init_db():
+    print("init_db called --------> ")
     conn = get_conn()
     cur = conn.cursor()
 
