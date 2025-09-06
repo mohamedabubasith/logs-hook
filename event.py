@@ -18,7 +18,6 @@ class BaseEvent(BaseModel):
 def client_ip(req: Request) -> Optional[str]:
     xff = req.headers.get("x-forwarded-for")
     if xff:
-        # Fix: split returns a list, so get first element then strip
         return xff.split(",")[0].strip()
     return req.client.host if req.client else None
 
@@ -57,15 +56,17 @@ async def list_events(
             conditions.append(WebhookEvent.event_type == event_type)
         if user_id:
             conditions.append(WebhookEvent.user_id == user_id)
+        
+        # Fix: Proper time range query syntax
         if from_ts is not None or to_ts is not None:
             rng = {}
             if from_ts is not None:
                 rng["$gte"] = from_ts
             if to_ts is not None:
                 rng["$lte"] = to_ts
-            conditions.append(WebhookEvent.created_at.in_(rng))
+            conditions.append({"created_at": rng})
+            
         if q:
-            # Fix: Use proper Beanie syntax for regex queries
             conditions.append({
                 "$or": [
                     {"payload": {"$regex": q, "$options": "i"}},
@@ -110,6 +111,8 @@ async def export_events(
             conditions.append(WebhookEvent.event_type == event_type)
         if user_id:
             conditions.append(WebhookEvent.user_id == user_id)
+            
+        # Fix: Consistent time range query syntax
         if from_ts is not None or to_ts is not None:
             rng = {}
             if from_ts is not None:
@@ -117,6 +120,7 @@ async def export_events(
             if to_ts is not None:
                 rng["$lte"] = to_ts
             conditions.append({"created_at": rng})
+            
         if q:
             conditions.append({"$or": [
                 {"payload": {"$regex": q, "$options": "i"}},
@@ -195,6 +199,8 @@ async def delete_events(
             conditions.append(WebhookEvent.event_type == event_type)
         if user_id:
             conditions.append(WebhookEvent.user_id == user_id)
+            
+        # Fix: Consistent time range query syntax
         if from_ts is not None or to_ts is not None:
             rng = {}
             if from_ts is not None:
@@ -202,19 +208,18 @@ async def delete_events(
             if to_ts is not None:
                 rng["$lte"] = to_ts
             conditions.append({"created_at": rng})
+            
         if q:
             conditions.append({"$or": [
                 {"payload": {"$regex": q, "$options": "i"}},
                 {"user_agent": {"$regex": q, "$options": "i"}},
             ]})
             
-        # Fix: Extract deleted_count from DeleteResult
         if conditions:
             result = await WebhookEvent.find({"$and": conditions}).delete()
         else:
             result = await WebhookEvent.delete_all()
             
-        # Return the count, not the DeleteResult object
         deleted_count = result.deleted_count if hasattr(result, 'deleted_count') else 0
         return {"ok": True, "deleted": deleted_count}
         

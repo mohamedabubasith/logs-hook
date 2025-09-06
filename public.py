@@ -69,25 +69,43 @@ async def public_track(req: Request, body: PublicIn):
                 "client": {"ip": ip, "user_agent": ua}
             }
         }
-
-        # Upsert by (page, ip)
-        existing = await PublicEvent.find_one(PublicEvent.page == body.path, PublicEvent.ip == ip)
         created_at = int(time.time())
+
+        # Fix: Check for existing record by BOTH page AND ip (your original logic was correct)
+        existing = await PublicEvent.find_one(PublicEvent.page == body.path, PublicEvent.ip == ip)
+        
         if existing:
+            # Update existing record for same path + same IP
             existing.ref = body.ref
             existing.user_agent = ua
             existing.payload = payload
             existing.created_at = created_at
             await existing.save()
             doc_id = str(existing.id)
+            action = "updated"
         else:
-            doc = PublicEvent(page=body.path, ref=body.ref, ip=ip, user_agent=ua, payload=payload, created_at=created_at)
+            # Create new record for new IP or new path
+            doc = PublicEvent(
+                page=body.path, 
+                ref=body.ref, 
+                ip=ip, 
+                user_agent=ua, 
+                payload=payload, 
+                created_at=created_at
+            )
             saved = await doc.insert()
             doc_id = str(saved.id)
+            action = "created"
 
-        return JSONResponse(content={"id": doc_id, "path": body.path, "visitor_info": body.visitor_info or {}})
+        return JSONResponse(content={
+            "id": doc_id, 
+            "path": body.path, 
+            "visitor_info": body.visitor_info or {},
+            "action": action
+        })
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @router.get("/public")
 async def list_public(
@@ -107,11 +125,13 @@ async def list_public(
                 {"user_agent": {"$regex": q, "$options": "i"}},
                 {"ref": {"$regex": q, "$options": "i"}},
             ]
+        
         query = PublicEvent.find(filt)
         total = await query.count()
 
+        # Fix: Sort by created_at descending (latest first) instead of -id
         if isinstance(limit, str) and limit.lower() == "all":
-            docs = await query.sort("-id").to_list()
+            docs = await query.sort(-PublicEvent.created_at).to_list()
             current_limit = total
             current_offset = 0
         else:
@@ -119,7 +139,7 @@ async def list_public(
                 lim_int = max(1, min(MAX_LIMIT, int(limit)))
             except Exception:
                 lim_int = 50
-            docs = await query.sort("-id").skip(offset).limit(lim_int).to_list()
+            docs = await query.sort(-PublicEvent.created_at).skip(offset).limit(lim_int).to_list()
             current_limit = lim_int
             current_offset = offset
 
@@ -127,6 +147,9 @@ async def list_public(
             items = [{
                 "id": str(d.id),
                 "path": d.page,
+                "ip": d.ip,  # Include IP in response
+                "user_agent": d.user_agent,  # Include user agent
+                "ref": d.ref,  # Include referrer
                 "visitor_info": ((d.payload or {}).get("data", {}) or {}).get("meta", {}) if isinstance(d.payload, dict) else {},
                 "created_at": d.created_at,
             } for d in docs]
@@ -134,10 +157,17 @@ async def list_public(
             items = [{
                 "id": str(d.id),
                 "path": d.page,
+                "ip": d.ip,  # Include IP in basic response too
                 "created_at": d.created_at,
             } for d in docs]
 
-        return {"total": total, "count": len(items), "offset": current_offset, "limit": current_limit, "items": items}
+        return {
+            "total": total, 
+            "count": len(items), 
+            "offset": current_offset, 
+            "limit": current_limit, 
+            "items": items
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -158,13 +188,18 @@ async def export_public(
                 {"user_agent": {"$regex": q, "$options": "i"}},
                 {"ref": {"$regex": q, "$options": "i"}},
             ]
-        docs = await PublicEvent.find(filt).sort("-id").to_list()
+        
+        # Fix: Sort by created_at descending for export too
+        docs = await PublicEvent.find(filt).sort(-PublicEvent.created_at).to_list()
 
         if fmt == "json":
             if include_payload:
                 items = [{
                     "id": str(d.id),
                     "path": d.page,
+                    "ip": d.ip,
+                    "user_agent": d.user_agent,
+                    "ref": d.ref,
                     "visitor_info": ((d.payload or {}).get("data", {}) or {}).get("meta", {}) if isinstance(d.payload, dict) else {},
                     "created_at": d.created_at,
                 } for d in docs]
@@ -172,26 +207,35 @@ async def export_public(
                 items = [{
                     "id": str(d.id),
                     "path": d.page,
+                    "ip": d.ip,
                     "created_at": d.created_at,
                 } for d in docs]
             return JSONResponse(content=items)
 
-        def to_csv(rows: List[Dict[str, Any]]):
+        def generate_csv():
             buffer = io.StringIO()
             writer = csv.writer(buffer)
             if include_payload:
-                writer.writerow(["id", "path", "created_at", "visitor_info"])
+                writer.writerow(["id", "path", "ip", "user_agent", "ref", "created_at", "visitor_info"])
                 for d in docs:
                     vi = ((d.payload or {}).get("data", {}) or {}).get("meta", {}) if isinstance(d.payload, dict) else {}
-                    writer.writerow([str(d.id), d.page, d.created_at, json.dumps(vi, ensure_ascii=False)])
+                    writer.writerow([
+                        str(d.id), 
+                        d.page, 
+                        d.ip or "", 
+                        d.user_agent or "", 
+                        d.ref or "", 
+                        d.created_at, 
+                        json.dumps(vi, ensure_ascii=False)
+                    ])
             else:
-                writer.writerow(["id", "path", "created_at"])
+                writer.writerow(["id", "path", "ip", "created_at"])
                 for d in docs:
-                    writer.writerow([str(d.id), d.page, d.created_at])
+                    writer.writerow([str(d.id), d.page, d.ip or "", d.created_at])
             yield buffer.getvalue()
 
         return StreamingResponse(
-            to_csv([]),
+            generate_csv(),
             media_type="text/csv",
             headers={"Content-Disposition": "attachment; filename=public_events_export.csv"},
         )
@@ -235,13 +279,11 @@ async def delete_public_events(
                 rng["$lte"] = to_ts
             conditions.append({"created_at": rng})
             
-        # Fix: Extract deleted_count from DeleteResult
         if conditions:
             result = await PublicEvent.find({"$and": conditions}).delete()
         else:
             result = await PublicEvent.delete_all()
             
-        # Return the count, not the DeleteResult object
         deleted_count = result.deleted_count if hasattr(result, 'deleted_count') else 0
         return {"ok": True, "deleted": deleted_count}
         
