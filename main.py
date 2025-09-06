@@ -5,6 +5,8 @@ from db import init_db
 from event import router as event_router
 from public import router as public_router
 
+from time import time
+
 app = FastAPI()
 
 # CORS: loosen for local dev; restrict in prod
@@ -23,3 +25,9 @@ def on_startup():
 # Mount routers
 app.include_router(event_router)
 app.include_router(public_router)
+
+
+@app.get("/")
+def health():
+    return {"ok": True, "status": "healthy", "ts": int(time())}
+
