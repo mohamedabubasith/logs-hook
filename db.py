@@ -1,7 +1,22 @@
 # db.py
 import os, sqlite3
 
-DB_PATH = os.environ.get("DB_PATH", "/data/events.sqlite")
+def _select_db_path() -> str:
+    # Respect explicit env first
+    env_path = os.environ.get("DB_PATH")
+    if env_path:
+        return env_path
+    # Prefer persistent mount if present, else fall back to tmp
+    for base in ("/data", "/persistent", "/workspace", "/home/user/app/data", "/tmp"):
+        try:
+            if os.path.isdir(base) and os.access(base, os.W_OK):
+                return os.path.join(base, "events.sqlite")
+        except Exception:
+            continue
+    # Last resort: current dir (may fail if read-only)
+    return os.path.abspath("events.sqlite")
+
+DB_PATH = _select_db_path()
 
 def _ensure_dir(path: str):
     d = os.path.dirname(path)
