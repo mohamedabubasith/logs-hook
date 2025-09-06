@@ -1,33 +1,9 @@
 # main.py
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from db import init_db
-from event import router as event_router
-from public import router as public_router
-
-from time import time
-
-app = FastAPI()
-
-# CORS: loosen for local dev; restrict in prod
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # e.g., ["https://your-portfolio.com"]
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-@app.on_event("startup")
-def on_startup():
-    init_db()
-
-# Mount routers
-app.include_router(event_router)
-app.include_router(public_router)
-
-
-@app.get("/")
-def health():
-    return {"ok": True, "status": "healthy", "ts": int(time())}
-
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "app:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True
+    )
