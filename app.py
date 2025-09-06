@@ -20,6 +20,7 @@ def create_app() -> FastAPI:
 
     @app.on_event("startup")
     def _startup():
+        print("Startup called --------> ")
         init_db()
 
     # Simple health check
