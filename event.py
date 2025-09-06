@@ -1,5 +1,5 @@
 # event.py
-from fastapi import APIRouter, Request, HTTPException, Query
+from fastapi import APIRouter, Request, HTTPException, Query, Path
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any
@@ -153,3 +153,50 @@ def export_events(
         media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=events_export.csv"},
     )
+
+@router.delete("/events/{event_id}")
+def delete_event_by_id(event_id: int = Path(..., ge=1)):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM webhook_events WHERE id = ?", (event_id,))
+    deleted = cur.rowcount
+    conn.commit()
+    conn.close()
+    if deleted == 0:
+        # 404 if nothing was deleted
+        raise HTTPException(status_code=404, detail="Event not found")
+    return {"ok": True, "deleted": deleted}
+
+@router.delete("/events")
+def delete_events(
+    event_type: Optional[str] = Query(default=None, description="Filter by type"),
+    user_id: Optional[str] = Query(default=None, description="Filter by user id"),
+    from_ts: Optional[int] = Query(default=None, description="Unix epoch secs from (inclusive)"),
+    to_ts: Optional[int] = Query(default=None, description="Unix epoch secs to (inclusive)"),
+    q: Optional[str] = Query(default=None, description="Substring search in payload/user_agent"),
+    confirm: bool = Query(default=False, description="Must be true to execute delete"),
+):
+    if not confirm:
+        raise HTTPException(status_code=400, detail="Set confirm=true to execute delete")
+    conn = get_conn()
+    cur = conn.cursor()
+
+    where, params = [], []
+    if event_type:
+        where.append("event_type = ?"); params.append(event_type)
+    if user_id:
+        where.append("user_id = ?"); params.append(user_id)
+    if from_ts is not None:
+        where.append("created_at >= ?"); params.append(from_ts)
+    if to_ts is not None:
+        where.append("created_at <= ?"); params.append(to_ts)
+    if q:
+        where.append("(payload LIKE ? OR user_agent LIKE ?)")
+        like = f"%{q}%"; params.extend([like, like])
+
+    where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+    cur.execute(f"DELETE FROM webhook_events {where_sql}", params)
+    deleted = cur.rowcount
+    conn.commit()
+    conn.close()
+    return {"ok": True, "deleted": deleted}

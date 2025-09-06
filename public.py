@@ -118,7 +118,7 @@ def list_public(
     q: Optional[str] = Query(default=None, description="Substring search in payload/user_agent/ref"),
     include_payload: bool = Query(default=False, description="Include visitor_info in response"),
     offset: int = Query(default=0, ge=0),
-    limit: int = Query(default=50, ge=1, le=MAX_LIMIT),
+    limit: Optional[str] = Query(default="50", description='Number of rows, or "all" to return everything'),
 ):
     conn = get_conn()
     cur = conn.cursor()
@@ -132,17 +132,34 @@ def list_public(
 
     where_sql = f"WHERE {' AND '.join(where)}" if where else ""
 
+    # Total count
     cur.execute(f"SELECT COUNT(*) AS c FROM public_events {where_sql}", params)
     total = cur.fetchone()["c"]
 
-    cur.execute(f"""
+    # Page or all
+    sql = f"""
         SELECT id, page, ref, ip, user_agent, payload, created_at
         FROM public_events
         {where_sql}
         ORDER BY id DESC
-        LIMIT ? OFFSET ?
-    """, params + [limit, offset])
-    rows = cur.fetchall()
+    """
+    rows = []
+    if isinstance(limit, str) and limit.lower() == "all":
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+        current_limit = total
+        current_offset = 0
+    else:
+        # parse numeric limit
+        try:
+            lim_int = max(1, min(200, int(limit)))
+        except Exception:
+            lim_int = 50
+        cur.execute(sql + " LIMIT ? OFFSET ?", params + [lim_int, offset])
+        rows = cur.fetchall()
+        current_limit = lim_int
+        current_offset = offset
+
     conn.close()
 
     if include_payload:
@@ -159,7 +176,7 @@ def list_public(
             "created_at": r["created_at"],
         } for r in rows]
 
-    return {"total": total, "count": len(items), "offset": offset, "limit": limit, "items": items}
+    return {"total": total, "count": len(items), "offset": current_offset, "limit": current_limit, "items": items}
 
 @router.get("/public/export")
 def export_public(
@@ -219,3 +236,43 @@ def export_public(
         media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=public_events_export.csv"},
     )
+
+
+from fastapi import Path
+
+@router.delete("/public/{public_id}")
+def delete_public_by_id(public_id: int = Path(..., ge=1)):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM public_events WHERE id = ?", (public_id,))
+    deleted = cur.rowcount
+    conn.commit()
+    conn.close()
+    if deleted == 0:
+        raise HTTPException(status_code=404, detail="Public event not found")
+    return {"ok": True, "deleted": deleted}
+
+@router.delete("/public")
+def delete_public(
+    page: Optional[str] = Query(default=None, description="Filter by path substring"),
+    q: Optional[str] = Query(default=None, description="Substring search in payload/user_agent/ref"),
+    confirm: bool = Query(default=False, description="Must be true to execute delete"),
+):
+    if not confirm:
+        raise HTTPException(status_code=400, detail="Set confirm=true to execute delete")
+    conn = get_conn()
+    cur = conn.cursor()
+
+    where, params = [], []
+    if page:
+        where.append("page LIKE ?"); params.append(f"%{page}%")
+    if q:
+        where.append("(payload LIKE ? OR user_agent LIKE ? OR ref LIKE ?)")
+        like = f"%{q}%"; params.extend([like, like, like])
+
+    where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+    cur.execute(f"DELETE FROM public_events {where_sql}", params)
+    deleted = cur.rowcount
+    conn.commit()
+    conn.close()
+    return {"ok": True, "deleted": deleted}
