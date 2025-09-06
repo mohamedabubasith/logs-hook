@@ -59,20 +59,31 @@ def client_ua(req: Request) -> str:
 @router.post("/public")
 async def public_track(req: Request, body: PublicIn):
     try:
-        ip = client_ip(req)
+        server_ip = client_ip(req)  # Get IP from server/headers
         ua = client_ua(req)
+        
+        # Start with all visitor_info data (spread it out)
+        payload_data = body.visitor_info.copy() if body.visitor_info else {}
+        
+        # Handle IP logic: use visitor_info IP if exists, otherwise use server IP
+        if "ip" not in payload_data or not payload_data.get("ip"):
+            payload_data["ip"] = server_ip
+        
+        # Always set user_agent from headers (can override visitor_info if needed)
+        payload_data["user_agent"] = ua
+        
         payload = {
             "path": body.path,
             "ref": body.ref,
-            "data": {
-                "meta": body.visitor_info or {},
-                "client": {"ip": ip, "user_agent": ua}
-            }
+            "data": payload_data  # All visitor_info + IP + user_agent at root level
         }
         created_at = int(time.time())
 
-        # Fix: Check for existing record by BOTH page AND ip (your original logic was correct)
-        existing = await PublicEvent.find_one(PublicEvent.page == body.path, PublicEvent.ip == ip)
+        # Use the IP from payload_data for database operations (either from visitor_info or server)
+        final_ip = payload_data.get("ip")
+        
+        # Check for existing record by BOTH page AND ip
+        existing = await PublicEvent.find_one(PublicEvent.page == body.path, PublicEvent.ip == final_ip)
         
         if existing:
             # Update existing record for same path + same IP
@@ -88,7 +99,7 @@ async def public_track(req: Request, body: PublicIn):
             doc = PublicEvent(
                 page=body.path, 
                 ref=body.ref, 
-                ip=ip, 
+                ip=final_ip,  # Use the final IP (from visitor_info or server)
                 user_agent=ua, 
                 payload=payload, 
                 created_at=created_at
@@ -100,8 +111,9 @@ async def public_track(req: Request, body: PublicIn):
         return JSONResponse(content={
             "id": doc_id, 
             "path": body.path, 
-            "visitor_info": body.visitor_info or {},
-            "action": action
+            "visitor_info": payload_data,  # Return the combined data
+            "action": action,
+            "ip_source": "visitor_info" if body.visitor_info.get("ip") else "server"  # Debug info
         })
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -129,7 +141,6 @@ async def list_public(
         query = PublicEvent.find(filt)
         total = await query.count()
 
-        # Fix: Sort by created_at descending (latest first) instead of -id
         if isinstance(limit, str) and limit.lower() == "all":
             docs = await query.sort(-PublicEvent.created_at).to_list()
             current_limit = total
@@ -147,17 +158,18 @@ async def list_public(
             items = [{
                 "id": str(d.id),
                 "path": d.page,
-                "ip": d.ip,  # Include IP in response
-                "user_agent": d.user_agent,  # Include user agent
-                "ref": d.ref,  # Include referrer
-                "visitor_info": ((d.payload or {}).get("data", {}) or {}).get("meta", {}) if isinstance(d.payload, dict) else {},
+                "ip": d.ip,
+                "user_agent": d.user_agent,
+                "ref": d.ref,
+                # Extract visitor_info from payload.data directly (now it's at root level)
+                "visitor_info": (d.payload or {}).get("data", {}) if isinstance(d.payload, dict) else {},
                 "created_at": d.created_at,
             } for d in docs]
         else:
             items = [{
                 "id": str(d.id),
                 "path": d.page,
-                "ip": d.ip,  # Include IP in basic response too
+                "ip": d.ip,
                 "created_at": d.created_at,
             } for d in docs]
 
